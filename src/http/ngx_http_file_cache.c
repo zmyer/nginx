@@ -553,7 +553,7 @@ ngx_http_file_cache_read(ngx_http_request_t *r, ngx_http_cache_t *c)
         return NGX_DECLINED;
     }
 
-    if (h->crc32 != c->crc32 || h->header_start != c->header_start) {
+    if (h->crc32 != c->crc32 || (size_t) h->header_start != c->header_start) {
         ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0,
                       "cache file \"%s\" has md5 collision", c->file.name.data);
         return NGX_DECLINED;
@@ -601,6 +601,8 @@ ngx_http_file_cache_read(ngx_http_request_t *r, ngx_http_cache_t *c)
     c->buf->last += n;
 
     c->valid_sec = h->valid_sec;
+    c->updating_sec = h->updating_sec;
+    c->error_sec = h->error_sec;
     c->last_modified = h->last_modified;
     c->date = h->date;
     c->valid_msec = h->valid_msec;
@@ -632,6 +634,8 @@ ngx_http_file_cache_read(ngx_http_request_t *r, ngx_http_cache_t *c)
     now = ngx_time();
 
     if (c->valid_sec < now) {
+        c->stale_updating = c->valid_sec + c->updating_sec >= now;
+        c->stale_error = c->valid_sec + c->error_sec >= now;
 
         ngx_shmtx_lock(&cache->shpool->mutex);
 
@@ -1252,6 +1256,8 @@ ngx_http_file_cache_set_header(ngx_http_request_t *r, u_char *buf)
 
     h->version = NGX_HTTP_CACHE_VERSION;
     h->valid_sec = c->valid_sec;
+    h->updating_sec = c->updating_sec;
+    h->error_sec = c->error_sec;
     h->last_modified = c->last_modified;
     h->date = c->date;
     h->crc32 = c->crc32;
@@ -1495,8 +1501,8 @@ ngx_http_file_cache_update_header(ngx_http_request_t *r)
     if (h.version != NGX_HTTP_CACHE_VERSION
         || h.last_modified != c->last_modified
         || h.crc32 != c->crc32
-        || h.header_start != c->header_start
-        || h.body_start != c->body_start)
+        || (size_t) h.header_start != c->header_start
+        || (size_t) h.body_start != c->body_start)
     {
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "http file cache \"%s\" content changed",
@@ -1513,6 +1519,8 @@ ngx_http_file_cache_update_header(ngx_http_request_t *r)
 
     h.version = NGX_HTTP_CACHE_VERSION;
     h.valid_sec = c->valid_sec;
+    h.updating_sec = c->updating_sec;
+    h.error_sec = c->error_sec;
     h.last_modified = c->last_modified;
     h.date = c->date;
     h.crc32 = c->crc32;
@@ -1680,7 +1688,7 @@ ngx_http_file_cache_cleanup(void *data)
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, c->file.log, 0,
                    "http file cache cleanup");
 
-    if (c->updating) {
+    if (c->updating && !c->background) {
         ngx_log_error(NGX_LOG_ALERT, c->file.log, 0,
                       "stalled cache updating, error:%ui", c->error);
     }
@@ -2112,6 +2120,17 @@ ngx_http_file_cache_add_file(ngx_tree_ctx_t *ctx, ngx_str_t *name)
         return NGX_ERROR;
     }
 
+    /*
+     * Temporary files in cache have a suffix consisting of a dot
+     * followed by 10 digits.
+     */
+
+    if (name->len >= 2 * NGX_HTTP_CACHE_KEY_LEN + 1 + 10
+        && name->data[name->len - 10 - 1] == '.')
+    {
+        return NGX_OK;
+    }
+
     if (ctx->size < (off_t) sizeof(ngx_http_file_cache_header_t)) {
         ngx_log_error(NGX_LOG_CRIT, ctx->log, 0,
                       "cache file \"%s\" is too small", name->data);
@@ -2256,7 +2275,6 @@ ngx_http_file_cache_set_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     off_t                   max_size;
     u_char                 *last, *p;
     time_t                  inactive;
-    size_t                  len;
     ssize_t                 size;
     ngx_str_t               s, name, *value;
     ngx_int_t               loader_files, manager_files;
@@ -2529,37 +2547,6 @@ ngx_http_file_cache_set_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         return NGX_CONF_ERROR;
     }
 
-    if (!use_temp_path) {
-        cache->temp_path = ngx_pcalloc(cf->pool, sizeof(ngx_path_t));
-        if (cache->temp_path == NULL) {
-            return NGX_CONF_ERROR;
-        }
-
-        len = cache->path->name.len + sizeof("/temp") - 1;
-
-        p = ngx_pnalloc(cf->pool, len + 1);
-        if (p == NULL) {
-            return NGX_CONF_ERROR;
-        }
-
-        cache->temp_path->name.len = len;
-        cache->temp_path->name.data = p;
-
-        p = ngx_cpymem(p, cache->path->name.data, cache->path->name.len);
-        ngx_memcpy(p, "/temp", sizeof("/temp"));
-
-        ngx_memcpy(&cache->temp_path->level, &cache->path->level,
-                   NGX_MAX_PATH_LEVEL * sizeof(size_t));
-
-        cache->temp_path->len = cache->path->len;
-        cache->temp_path->conf_file = cf->conf_file->file.name.data;
-        cache->temp_path->line = cf->conf_file->line;
-
-        if (ngx_add_path(cf, &cache->temp_path) != NGX_OK) {
-            return NGX_CONF_ERROR;
-        }
-    }
-
     cache->shm_zone = ngx_shared_memory_add(cf, &name, size, cmd->post);
     if (cache->shm_zone == NULL) {
         return NGX_CONF_ERROR;
@@ -2574,6 +2561,8 @@ ngx_http_file_cache_set_slot(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     cache->shm_zone->init = ngx_http_file_cache_init;
     cache->shm_zone->data = cache;
+
+    cache->use_temp_path = use_temp_path;
 
     cache->inactive = inactive;
     cache->max_size = max_size;
